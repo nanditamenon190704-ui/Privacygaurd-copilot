@@ -137,7 +137,7 @@
   .sitefoot { margin: 22px 0 10px; padding-top: 16px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 13px; color: #71717a; }
   .sitefoot a, .sitefoot button { color: var(--pink2); background: none; border: none; padding: 0; font-size: 13px; text-decoration: none; }
   .sitefoot a:hover, .sitefoot button:hover { text-decoration: underline; }
-  .sitefoot .links { display: flex; gap: 14px; }
+  .sitefoot .links { display: flex; gap: 14px; flex-wrap: wrap; }
 
   /* Chat turns */
   .turn { margin-bottom: 30px; }
@@ -257,9 +257,147 @@
 <div id="root"></div>
 
 <script>
-/* ===== LITE MODE ... */
+/* ===== LITE MODE: redaction in the browser, AI call through a Cloudflare Worker ===== */
 const WORKER_URL = "https://take-off-ai.nanditamenon190704.workers.dev";
-... lots of code ...
+
+const STOP = new Set((
+  "a an the and or but if in on at to of for from with by as is are was were be been am i im it we you my our your this that " +
+  "he she him her his hers they them their its who whom what when where why how " +
+  "dear hi hello hey thank thanks please customer client support team agent agents notes note ticket tickets refund order orders " +
+  "call calls log subject regards sincerely warm best kind yours sir madam mr mrs ms dr prof " +
+  "monday tuesday wednesday thursday friday saturday sunday " +
+  "january february march april may june july august september october november december " +
+  "rs upi kyc aadhaar email phone mobile number address manager not very so sorry writing calling contacting having getting " +
+  "trying looking unable still just really also here there happy glad afraid sure ok okay fine good bad upset angry unhappy " +
+  "disappointed waiting reaching emailing messaging requesting wondering new urgent important serious annoyed confused " +
+  "interested applying reporting facing experiencing unsure concerned worried frustrated satisfied pleased planning hoping asking seeking"
+).split(" "));
+
+const PLACES = ["New Delhi","Kakkanad","Kochi","Cochin","Ernakulam","Thrissur","Kozhikode","Calicut","Thiruvananthapuram",
+  "Trivandrum","Kollam","Kannur","Palakkad","Alappuzha","Kottayam","Kerala","Bengaluru","Bangalore","Chennai","Mumbai",
+  "Delhi","Hyderabad","Kolkata","Pune","Ahmedabad","Jaipur","Coimbatore","Mysuru","Mangaluru","India"];
+const PLACE_RE = new RegExp("\\b(?:" + PLACES.join("|") + ")\\b", "gi");
+
+function liteRedact(text) {
+  const claims = [];
+  const overlaps = (s, e) => claims.some((c) => s < c.end && e > c.start);
+  const claim = (s, e, type) => { if (e > s && !overlaps(s, e)) claims.push({ start: s, end: e, type }); };
+  const scan = (re, type) => { for (const m of text.matchAll(re)) claim(m.index, m.index + m[0].length, type); };
+
+  // Structured data
+  scan(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "EMAIL_ADDRESS");
+  scan(/(?<!\d)(?:\d[ -]?){12,15}\d(?!\d)/g, "CREDIT_CARD");
+  scan(/(?<!\d)\d{4}[ -]?\d{4}[ -]?\d{4}(?![ -]?\d)/g, "AADHAAR");
+  scan(/(?<!\d)(?:\+91[ -]?)?[6-9]\d{4}[ -]?\d{5}(?!\d)/g, "PHONE_NUMBER");
+  scan(/(?<!\d)\+\d{1,3}[ -]?\d{2,5}[ -]?\d{3,5}[ -]?\d{0,5}(?!\d)/g, "PHONE_NUMBER");
+  scan(/(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])/g, "IP_ADDRESS");
+  scan(/(?<!\d)\d{9,13}(?!\d)/g, "NUMBER");          // safety net: any long digit run
+  scan(PLACE_RE, "LOCATION");
+
+  // Names: titles, introductions, then capitalised word pairs
+  for (const m of text.matchAll(/\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Shri|Smt|Sri)\.?[ \t]+([A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+)?)/gd)) {
+    claim(m.indices[1][0], m.indices[1][1], "PERSON");
+  }
+  const introHandler = (m) => {
+    const w1 = m[1];
+    if (!w1 || w1.length < 2 || STOP.has(w1.toLowerCase())) return;
+    let end = m.indices[1][1];
+    if (m[2] && m[2].length > 1 && !STOP.has(m[2].toLowerCase())) end = m.indices[2][1];
+    claim(m.indices[1][0], end, "PERSON");
+  };
+  for (const m of text.matchAll(/\b(?:my name is|name is|call me|i am|i['’]m|im)[ \t]+([A-Za-z]+)(?:[ \t]+([A-Za-z]+))?/gid)) introHandler(m);
+  for (const m of text.matchAll(/\bThis is[ \t]+([A-Z][a-z]+)(?:[ \t]+([A-Z][a-z]+))?/gd)) introHandler(m);
+
+  for (const m of text.matchAll(/\b[A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+){1,2}\b/g)) {
+    const words = [...m[0].matchAll(/[A-Za-z]+/g)].map((w) => ({
+      t: w[0], s: m.index + w.index, e: m.index + w.index + w[0].length,
+    }));
+    const greeted = ["dear", "hi", "hello", "hey"].includes(words[0].t.toLowerCase());
+    while (words.length && STOP.has(words[0].t.toLowerCase())) words.shift();
+    while (words.length && STOP.has(words[words.length - 1].t.toLowerCase())) words.pop();
+    if (words.length >= 2 || (greeted && words.length === 1)) {
+      claim(words[0].s, words[words.length - 1].e, "PERSON");
+    }
+  }
+
+  // Later mentions of a first or last name
+  const names = new Set();
+  for (const c of claims.filter((c) => c.type === "PERSON")) {
+    for (const w of text.slice(c.start, c.end).split(/\s+/)) {
+      if (w.length > 2 && !STOP.has(w.toLowerCase())) names.add(w);
+    }
+  }
+  for (const w of names) scan(new RegExp("\\b" + w + "\\b", "g"), "PERSON");
+
+  // Build the redacted text and the private label-to-value map
+  claims.sort((a, b) => a.start - b.start);
+  const mapping = {}, seen = {}, counters = {}, counts = {};
+  let out = "", last = 0;
+  for (const c of claims) {
+    const value = text.slice(c.start, c.end);
+    const key = c.type + "|" + value.toLowerCase();
+    let ph = seen[key];
+    if (!ph && c.type === "PERSON" && !/\s/.test(value)) {
+      for (const k in seen) {
+        if (k.startsWith("PERSON|") && k.slice(7).split(/\s+/).includes(value.toLowerCase())) { ph = seen[k]; break; }
+      }
+    }
+    if (!ph) {
+      counters[c.type] = (counters[c.type] || 0) + 1;
+      ph = "<" + c.type + "_" + counters[c.type] + ">";
+      mapping[ph] = value;
+    }
+    seen[key] = ph;
+    out += text.slice(last, c.start) + ph;
+    last = c.end;
+    counts[c.type] = (counts[c.type] || 0) + 1;
+  }
+  out += text.slice(last);
+  return { redacted_text: out, counts, mapping };
+}
+
+function liteTidy(reply, mapping) {
+  reply = reply.replace(/\*\*/g, "");
+  return reply.replace(/<([A-Z_]+)(_\d+)?>/g, (full, name, num) =>
+    num && mapping[full] ? full : "[" + name.replace(/_/g, " ").toLowerCase() + "]"
+  );
+}
+
+function liteRestore(text, mapping) {
+  for (const ph in mapping) text = text.split(ph).join(mapping[ph]);
+  return text;
+}
+
+/* The page was built to talk to a Python server. This adapter answers those
+   calls in the browser instead, and sends only redacted text to the Worker. */
+const realFetch = window.fetch.bind(window);
+window.fetch = async (url, opts) => {
+  if (url === "/audit") {
+    try {
+      const r = await realFetch(WORKER_URL);
+      return new Response("[]", { status: r.ok ? 200 : 503 });
+    } catch (e) { return new Response("[]", { status: 503 }); }
+  }
+  if (url === "/ask") {
+    const { text, question } = JSON.parse(opts.body);
+    const r = liteRedact(text);
+    const res = await realFetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ redacted_text: r.redacted_text, labels: Object.keys(r.mapping), question }),
+    });
+    if (!res.ok) return new Response("{}", { status: res.status });
+    const data = await res.json();
+    const aiAnswer = liteTidy(data.answer || "", r.mapping);
+    return new Response(JSON.stringify({
+      redacted_text: r.redacted_text,
+      counts: r.counts,
+      ai_answer: aiAnswer,
+      answer: liteRestore(aiAnswer, r.mapping),
+    }), { status: 200 });
+  }
+  return realFetch(url, opts);
+};
 </script>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
@@ -270,9 +408,10 @@ const WORKER_URL = "https://take-off-ai.nanditamenon190704.workers.dev";
 const { useState, useRef, useEffect } = React;
 
 const BUILDER = "Nandita Menon";
-const LINKEDIN = "https://www.linkedin.com/in/nandita-menon-8197a5355/";
 const EMAIL = "nanditamenon190704@gmail.com";
 const GMAIL = "https://mail.google.com/mail/?view=cm&fs=1&to=" + EMAIL + "&su=TAKE%20OFF";
+const LINKEDIN = "https://www.linkedin.com/in/nandita-menon-8197a5355/";
+
 const SAMPLES = {
   ticket:
     "Ticket #4821. Customer Arjun Varma (arjun.varma@example.com, 98470 12345) from Kakkanad wrote: " +
@@ -298,8 +437,8 @@ const FEATURES = [
   { n: "04", t: "Real values restored", d: "Labels are swapped back into the answer on your side, so you get 'Dear Arjun' without the AI ever knowing it." },
   { n: "05", t: "Fail-safe redaction", d: "Any long run of digits is hidden even when it is not a valid number. It fails toward privacy." },
   { n: "06", t: "See what the AI saw", d: "Every result shows your original, the cleaned version and what the AI wrote, side by side." },
-  { n: "07", t: "Privacy-safe audit trail", d: "The audit log stores only counts and timestamps. Raw text and real values are never logged." },
-  { n: "08", t: "Swappable AI model", d: "Built with Semantic Kernel, so the model can move from Groq to Azure AI Foundry by changing config." },
+  { n: "07", t: "Privacy-safe by design", d: "Nothing is stored. The full version's audit log keeps only counts and timestamps, never raw text or real values." },
+  { n: "08", t: "Swappable AI model", d: "The full version uses Semantic Kernel, so the model can move from Groq to Azure AI Foundry by changing config." },
 ];
 
 const STEPS = [
@@ -641,7 +780,7 @@ function Welcome({ onContact, onPrivacy, onAbout }) {
         </p>
         <div className="badges">
           <span className="badge">Redaction runs in your browser</span>
-          <span className="badge">No raw text in logs</span>
+          <span className="badge">Nothing is stored</span>
           <span className="badge">Aadhaar and +91 aware</span>
           <span className="badge">Move your mouse around</span>
         </div>
@@ -837,7 +976,7 @@ function App() {
           <div className="logo">
             <span className="logo-badge"><PlaneIcon size={17} /></span>
             TAKE OFF
-            <span className="status" title="Connection to your local server">
+            <span className="status" title="Connection to the AI helper">
               <span className={"dot " + (online === true ? "on" : online === false ? "off" : "")}></span>
               {online === true ? "Connected" : online === false ? "Server offline" : "Checking"}
             </span>
@@ -926,11 +1065,12 @@ function App() {
             </p>
             <ul>
               <li>Your private data never reaches the AI model.</li>
-              <li>Nothing personal is written to logs. Only counts and timestamps.</li>
+              <li>Nothing personal is stored. The full version logs only counts and timestamps.</li>
               <li>You can always see exactly what the AI was shown.</li>
             </ul>
-            <p><b>Built by {BUILDER}</b>, an electronics and communication engineering graduate, using Python, FastAPI,
-              Semantic Kernel, Microsoft Presidio and React.</p>
+            <p><b>Built by {BUILDER}.</b> The full version runs on Python, FastAPI, Semantic Kernel and
+              Microsoft Presidio. This live demo is a lighter version: the privacy filter runs in your browser
+              with simpler detection rules, and the AI is called through a small Cloudflare Worker.</p>
             <div className="btnrow">
               <a className="linkbtn" href={GMAIL} target="_blank" rel="noopener">Email {BUILDER.split(" ")[0]}</a>
               <a className="linkbtn" href={LINKEDIN} target="_blank" rel="noopener">LinkedIn</a>
@@ -973,8 +1113,8 @@ function App() {
             <ul>
               <li>Detection and redaction run in your browser, before anything is sent anywhere.</li>
               <li>Only the redacted text, with labels like PERSON_1, is sent through a small Cloudflare Worker to the AI provider (Groq in this demo).</li>
-              <li>The map from labels back to real values is sent through a small Cloudflare Worker to the AI provider (Groq in thstays in your browser and is never sent to the model.is demo).</li>
-              <li>The audit log keeps only counts and timestamps. Raw text is not stored.</li>
+              <li>The map from labels back to real values stays in your browser and is never sent to the model.</li>
+              <li>This demo does not store your text.</li>
               <li>Detection is not perfect, so please use fake or synthetic data when you try it.</li>
             </ul>
           </Modal>
